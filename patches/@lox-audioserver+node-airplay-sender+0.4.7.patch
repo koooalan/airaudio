@@ -1,0 +1,235 @@
+diff --git a/node_modules/@lox-audioserver/node-airplay-sender/dist/core/audioOut.js b/node_modules/@lox-audioserver/node-airplay-sender/dist/core/audioOut.js
+index 84585d0..e339fae 100644
+--- a/node_modules/@lox-audioserver/node-airplay-sender/dist/core/audioOut.js
++++ b/node_modules/@lox-audioserver/node-airplay-sender/dist/core/audioOut.js
+@@ -15,9 +15,18 @@ class AudioOut extends node_events_1.EventEmitter {
+     lastSeq = -1;
+     hasAirTunes = false;
+     rtpTimeRef = Date.now();
++    _perfRef = performance.now(); // monotonic reference aligned to rtpTimeRef
+     startTimeMs;
+     latencyFrames = 0;
+     latencyApplied = false;
++    /**
++     * Align the monotonic performance reference to the current rtpTimeRef epoch value.
++     * Call this whenever rtpTimeRef changes so the syncAudio loop stays consistent.
++     */
++    _alignPerfRef() {
++        // performance.now() - _perfRef == Date.now() - rtpTimeRef at this instant
++        this._perfRef = performance.now() - (Date.now() - this.rtpTimeRef);
++    }
+     /**
+      * Begin pulling from the buffer and emitting packets at the configured cadence.
+      * @param devices Device manager for sync events.
+@@ -30,6 +39,7 @@ class AudioOut extends node_events_1.EventEmitter {
+                 ? startTimeMs
+                 : undefined;
+         this.rtpTimeRef = this.startTimeMs ?? Date.now();
++        this._alignPerfRef();
+         devices.on('airtunes_devices', (hasAirTunes) => {
+             this.hasAirTunes = hasAirTunes;
+         });
+@@ -39,7 +49,7 @@ class AudioOut extends node_events_1.EventEmitter {
+         const sendPacket = (seq) => {
+             const packet = circularBuffer.readPacket();
+             packet.seq = seq % SEQ_NUM_WRAP;
+-            packet.timestamp = (0, numUtil_1.low32)(seq * config_1.default.frames_per_packet + 2 * config_1.default.sampling_rate);
++            packet.timestamp = (0, numUtil_1.low32)(seq * config_1.default.frames_per_packet + config_1.default.latency_seconds * config_1.default.sampling_rate);
+             if (this.hasAirTunes && seq % config_1.default.sync_period === 0) {
+                 this.emit('need_sync', seq);
+                 const expectedTimeMs = this.rtpTimeRef +
+@@ -51,7 +61,9 @@ class AudioOut extends node_events_1.EventEmitter {
+             packet.release();
+         };
+         const syncAudio = () => {
+-            const elapsed = Date.now() - this.rtpTimeRef;
++            // Use monotonic performance.now() so NTP clock corrections
++            // don't cause burst sends that distort/speed up audio.
++            const elapsed = performance.now() - this._perfRef;
+             if (elapsed < 0) {
+                 setTimeout(syncAudio, Math.min(config_1.default.stream_latency, Math.abs(elapsed)));
+                 return;
+@@ -78,6 +90,7 @@ class AudioOut extends node_events_1.EventEmitter {
+         }
+         const latencyMs = (this.latencyFrames / config_1.default.sampling_rate) * 1000;
+         this.rtpTimeRef = this.startTimeMs - latencyMs;
++        this._alignPerfRef(); // keep monotonic ref in sync with updated rtpTimeRef
+         this.latencyApplied = true;
+     }
+ }
+diff --git a/node_modules/@lox-audioserver/node-airplay-sender/dist/core/deviceAirtunes.js b/node_modules/@lox-audioserver/node-airplay-sender/dist/core/deviceAirtunes.js
+index 861d559..7d3dab9 100644
+--- a/node_modules/@lox-audioserver/node-airplay-sender/dist/core/deviceAirtunes.js
++++ b/node_modules/@lox-audioserver/node-airplay-sender/dist/core/deviceAirtunes.js
+@@ -470,7 +470,7 @@ function makeAirTunesPacket(packet, encoder, requireEncryption, alacEncoding = t
+             : pcmParse(packet.pcm);
+     var airTunes = Buffer.alloc(alac.length + RTP_HEADER_SIZE);
+     var header = makeRTPHeader(packet);
+-    if (requireEncryption) {
++    if (requireEncryption && !credentials) {
+         alac = encryptAES(alac, alac.length);
+     }
+     if (credentials) {
+diff --git a/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/core/deviceAirtunes.js b/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/core/deviceAirtunes.js
+index 861d559..7d3dab9 100644
+--- a/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/core/deviceAirtunes.js
++++ b/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/core/deviceAirtunes.js
+@@ -470,7 +470,7 @@ function makeAirTunesPacket(packet, encoder, requireEncryption, alacEncoding = t
+             : pcmParse(packet.pcm);
+     var airTunes = Buffer.alloc(alac.length + RTP_HEADER_SIZE);
+     var header = makeRTPHeader(packet);
+-    if (requireEncryption) {
++    if (requireEncryption && !credentials) {
+         alac = encryptAES(alac, alac.length);
+     }
+     if (credentials) {
+diff --git a/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/homekit/encryption.js b/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/homekit/encryption.js
+index b73c438..f58ebcf 100644
+--- a/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/homekit/encryption.js
++++ b/node_modules/@lox-audioserver/node-airplay-sender/dist/esm/homekit/encryption.js
+@@ -4,28 +4,20 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
+ const crypto_1 = __importDefault(require("crypto"));
++const { ChaCha20Poly1305 } = require('@stablelib/chacha20poly1305');
+ /**
+  * AirPlay 2/HomeKit encryption helpers (ChaCha20-Poly1305 + HKDF) ported from node_airtunes2.
+  */
+-// i'd really prefer for this to be a direct call to
+-// Sodium.crypto_aead_chacha20poly1305_decrypt()
+-// but unfortunately the way it constructs the message to
+-// calculate the HMAC is not compatible with homekit
+-// (long story short, it uses [ AAD, AAD.length, CipherText, CipherText.length ]
+-// whereas homekit expects [ AAD, CipherText, AAD.length, CipherText.length ]
+ function verifyAndDecrypt(cipherText, mac, AAD, nonce, key) {
+     try {
+         let nonceBuf = nonce;
+         if (nonceBuf.byteLength === 8) {
+             nonceBuf = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x00]), nonceBuf]);
+         }
+-        const decipher = crypto_1.default.createDecipheriv('chacha20-poly1305', key, nonceBuf, { authTagLength: 16 });
+-        if (AAD != null) {
+-            decipher.setAAD(AAD); // must be called before data
+-        }
+-        decipher.setAuthTag(mac);
+-        const decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()]);
+-        return decrypted;
++        const aead = new ChaCha20Poly1305(Uint8Array.from(key));
++        const combined = Buffer.concat([Buffer.from(cipherText), Buffer.from(mac)]);
++        const result = aead.open(Uint8Array.from(nonceBuf), combined, AAD != null ? Uint8Array.from(AAD) : undefined);
++        return result ? Buffer.from(result) : null;
+     }
+     catch (error) {
+         return null;
+@@ -36,24 +28,15 @@ function encryptAndSeal(plainText, AAD, nonce, key) {
+     if (nonceBuf.byteLength === 8) {
+         nonceBuf = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x00]), nonceBuf]);
+     }
+-    const cipher = crypto_1.default.createCipheriv('chacha20-poly1305', key, nonceBuf, { authTagLength: 16 });
+-    if (AAD != null) {
+-        cipher.setAAD(AAD); // must be called before data
+-    }
+-    const cipherText = Buffer.concat([cipher.update(plainText), cipher.final()]);
+-    const hmac = cipher.getAuthTag();
++    const aead = new ChaCha20Poly1305(Uint8Array.from(key));
++    const sealed = aead.seal(Uint8Array.from(nonceBuf), Uint8Array.from(plainText), AAD != null ? Uint8Array.from(AAD) : undefined);
++    const cipherText = Buffer.from(sealed.slice(0, -16));
++    const hmac = Buffer.from(sealed.slice(-16));
+     return [cipherText, hmac];
+ }
+-// function getPadding(buffer, blockSize) {
+-//     return buffer.length % blockSize === 0
+-//         ? Buffer.alloc(0)
+-//         : Buffer.alloc(blockSize - (buffer.length % blockSize));
+-// }
+ function HKDF(hashAlg, salt, ikm, info, size) {
+-    // create the hash alg to see if it exists and get its length
+     const hash = crypto_1.default.createHash(hashAlg);
+     const hashLength = hash.digest().length;
+-    // now we compute the PRK
+     const hmac = crypto_1.default.createHmac(hashAlg, salt);
+     hmac.update(ikm);
+     const prk = hmac.digest();
+diff --git a/node_modules/@lox-audioserver/node-airplay-sender/dist/homekit/encryption.js b/node_modules/@lox-audioserver/node-airplay-sender/dist/homekit/encryption.js
+index b73c438..f13eb4e 100644
+--- a/node_modules/@lox-audioserver/node-airplay-sender/dist/homekit/encryption.js
++++ b/node_modules/@lox-audioserver/node-airplay-sender/dist/homekit/encryption.js
+@@ -4,28 +4,23 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
+ const crypto_1 = __importDefault(require("crypto"));
++// Use @stablelib/chacha20poly1305 (CJS) instead of Node crypto's chacha20-poly1305,
++// which is unavailable in Electron's OpenSSL build on Windows.
++const { ChaCha20Poly1305 } = require('@stablelib/chacha20poly1305');
+ /**
+  * AirPlay 2/HomeKit encryption helpers (ChaCha20-Poly1305 + HKDF) ported from node_airtunes2.
+  */
+-// i'd really prefer for this to be a direct call to
+-// Sodium.crypto_aead_chacha20poly1305_decrypt()
+-// but unfortunately the way it constructs the message to
+-// calculate the HMAC is not compatible with homekit
+-// (long story short, it uses [ AAD, AAD.length, CipherText, CipherText.length ]
+-// whereas homekit expects [ AAD, CipherText, AAD.length, CipherText.length ]
+ function verifyAndDecrypt(cipherText, mac, AAD, nonce, key) {
+     try {
+         let nonceBuf = nonce;
+         if (nonceBuf.byteLength === 8) {
+             nonceBuf = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x00]), nonceBuf]);
+         }
+-        const decipher = crypto_1.default.createDecipheriv('chacha20-poly1305', key, nonceBuf, { authTagLength: 16 });
+-        if (AAD != null) {
+-            decipher.setAAD(AAD); // must be called before data
+-        }
+-        decipher.setAuthTag(mac);
+-        const decrypted = Buffer.concat([decipher.update(cipherText), decipher.final()]);
+-        return decrypted;
++        const aead = new ChaCha20Poly1305(Uint8Array.from(key));
++        // open() expects ciphertext + 16-byte auth tag concatenated
++        const combined = Buffer.concat([Buffer.from(cipherText), Buffer.from(mac)]);
++        const result = aead.open(Uint8Array.from(nonceBuf), combined, AAD != null ? Uint8Array.from(AAD) : undefined);
++        return result ? Buffer.from(result) : null;
+     }
+     catch (error) {
+         return null;
+@@ -36,24 +31,16 @@ function encryptAndSeal(plainText, AAD, nonce, key) {
+     if (nonceBuf.byteLength === 8) {
+         nonceBuf = Buffer.concat([Buffer.from([0x00, 0x00, 0x00, 0x00]), nonceBuf]);
+     }
+-    const cipher = crypto_1.default.createCipheriv('chacha20-poly1305', key, nonceBuf, { authTagLength: 16 });
+-    if (AAD != null) {
+-        cipher.setAAD(AAD); // must be called before data
+-    }
+-    const cipherText = Buffer.concat([cipher.update(plainText), cipher.final()]);
+-    const hmac = cipher.getAuthTag();
++    const aead = new ChaCha20Poly1305(Uint8Array.from(key));
++    // seal() returns ciphertext + 16-byte auth tag concatenated
++    const sealed = aead.seal(Uint8Array.from(nonceBuf), Uint8Array.from(plainText), AAD != null ? Uint8Array.from(AAD) : undefined);
++    const cipherText = Buffer.from(sealed.slice(0, -16));
++    const hmac = Buffer.from(sealed.slice(-16));
+     return [cipherText, hmac];
+ }
+-// function getPadding(buffer, blockSize) {
+-//     return buffer.length % blockSize === 0
+-//         ? Buffer.alloc(0)
+-//         : Buffer.alloc(blockSize - (buffer.length % blockSize));
+-// }
+ function HKDF(hashAlg, salt, ikm, info, size) {
+-    // create the hash alg to see if it exists and get its length
+     const hash = crypto_1.default.createHash(hashAlg);
+     const hashLength = hash.digest().length;
+-    // now we compute the PRK
+     const hmac = crypto_1.default.createHmac(hashAlg, salt);
+     hmac.update(ikm);
+     const prk = hmac.digest();
+diff --git a/node_modules/@lox-audioserver/node-airplay-sender/dist/utils/config.js b/node_modules/@lox-audioserver/node-airplay-sender/dist/utils/config.js
+index c67fcba..f3050b0 100644
+--- a/node_modules/@lox-audioserver/node-airplay-sender/dist/utils/config.js
++++ b/node_modules/@lox-audioserver/node-airplay-sender/dist/utils/config.js
+@@ -17,6 +17,7 @@ exports.config = {
+     coreaudio_check_period: 2000, // CoreAudio buffer level check period
+     coreaudio_preload: 352 * 2 * 2 * 50, // ~0.5s of silence pushed to CoreAudio to avoid draining AudioQueue
+     sampling_rate: 44100, // fixed by AirTunes v2
++    latency_seconds: 2.0, // RTP timestamp pre-roll: receiver buffers this many seconds before playing
+     sync_period: 126, // UDP sync packets are sent to all AirTunes devices regularly
+     stream_latency: 200, // audio UDP packets are flushed in bursts periodically
+     rtsp_timeout: 15000, // RTSP servers are considered gone if no reply is received before the timeout

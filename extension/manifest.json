@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "AirAudio AV Sync",
+  "version": "1.0.0",
+  "description": "Delays video playback to match AirAudio AirPlay speaker latency.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://localhost:17374/*",
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AirAudio AV Sync",
+    "default_icon": {
+      "16":  "icon-16.png",
+      "48":  "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "icons": {
+    "16":  "icon-16.png",
+    "48":  "icon-48.png",
+    "128": "icon-128.png"
+  }
+}

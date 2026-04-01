@@ -1,0 +1,22 @@
+node_modules/
+out/
+dist/
+*.tsbuildinfo
+.env
+.env.local
+*.log
+npm-debug.log*
+assets/icon.ico
+*.mp3
+*.wav
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Claude Code local settings
+.claude/
+
+# Design/working files
+*.ai
+Screenshot*.png
