@@ -17,6 +17,13 @@ type StoredConfig = {
   latencySeconds: number
   syncOffsetMs: number
   airplay1DeviceIds: string[]
+  /** Cached auth+subscription state — used by main process before renderer initialises. */
+  authCache?: {
+    uid: string
+    email: string
+    isPremium: boolean
+    lastUpdated: number   // Unix ms
+  }
 }
 
 const CONFIG_PATH = join(app.getPath('userData'), 'config.json')
@@ -29,7 +36,7 @@ function load(): StoredConfig {
   } catch {
     // Corrupt or missing — start fresh
   }
-  return { knownDevices: {}, customNames: {}, pinnedDevices: [], latencySeconds: 1.0, syncOffsetMs: 0, airplay1DeviceIds: [] }
+  return { knownDevices: {}, customNames: {}, pinnedDevices: [], latencySeconds: 1.0, syncOffsetMs: 0, airplay1DeviceIds: [], authCache: undefined }
 }
 
 function save(): void {
@@ -90,6 +97,19 @@ export const configStore = {
   },
   getAllCustomNames(): Record<string, string> {
     return { ...(_cfg.customNames ?? {}) }
+  },
+
+  // ── Auth cache (main process reads this before renderer sends first status update) ──
+  getAuthCache(): StoredConfig['authCache'] {
+    return _cfg.authCache
+  },
+  setAuthCache(data: NonNullable<StoredConfig['authCache']>): void {
+    _cfg.authCache = data
+    save()
+  },
+  clearAuthCache(): void {
+    _cfg.authCache = undefined
+    save()
   },
 
   // ── AirPlay 1 device memory (persisted so we skip AirPlay 2 PAIR_SETUP on restart) ──

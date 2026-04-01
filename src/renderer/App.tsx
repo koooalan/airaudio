@@ -1,15 +1,38 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { DeviceInfo, ConnectionState } from '../shared/types.js'
+import type { DeviceInfo, ConnectionState, AuthStatus, UpdateStatus } from '../shared/types.js'
 import {
   startCapture, stopCapture, restartCapture,
   setMuted, getMuted, getAudioSources,
   type AudioSourceInfo,
 } from './capture/audio-capturer.js'
 
+// ── Firebase ──────────────────────────────────────────────────────────────────
+// Config is injected at build time from .env (VITE_FIREBASE_* vars).
+// If the vars are missing (dev without Firebase), auth features are disabled.
+import { initializeApp } from 'firebase/app'
+import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth'
+import { getFirestore, doc, onSnapshot } from 'firebase/firestore'
+
+const _fbConfig = {
+  apiKey:            import.meta.env.VITE_FIREBASE_API_KEY            as string | undefined,
+  authDomain:        import.meta.env.VITE_FIREBASE_AUTH_DOMAIN        as string | undefined,
+  projectId:         import.meta.env.VITE_FIREBASE_PROJECT_ID         as string | undefined,
+  storageBucket:     import.meta.env.VITE_FIREBASE_STORAGE_BUCKET     as string | undefined,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID as string | undefined,
+  appId:             import.meta.env.VITE_FIREBASE_APP_ID             as string | undefined,
+}
+
+const _fbReady = !!_fbConfig.apiKey
+const _fbApp  = _fbReady ? initializeApp(_fbConfig as Required<typeof _fbConfig>) : null
+const _fbAuth = _fbApp   ? getAuth(_fbApp)       : null
+const _fbDb   = _fbApp   ? getFirestore(_fbApp)  : null
+const _googleProvider = _fbAuth ? new GoogleAuthProvider() : null
+
+// ── IPC window type ───────────────────────────────────────────────────────────
 declare global {
   interface Window {
     airAudio: {
-      getState: () => Promise<{ devices: DeviceInfo[]; state: ConnectionState; connectedDeviceId: string | null; latencySeconds: number; volume: number }>
+      getState: () => Promise<{ devices: DeviceInfo[]; state: ConnectionState; connectedDeviceId: string | null; latencySeconds: number; syncOffsetMs: number; volume: number }>
       connect: (deviceId: string, volume: number) => Promise<void>
       disconnect: () => Promise<void>
       setVolume: (volumePct: number) => Promise<void>
@@ -20,14 +43,22 @@ declare global {
       getDesktopSourceId: () => Promise<string | null>
       openExtensionFolder: () => Promise<string>
       sendPcmChunk: (chunk: ArrayBuffer) => void
+      reportAuthStatus: (status: AuthStatus) => void
+      getAuthStatus: () => Promise<AuthStatus>
+      openPurchaseUrl: () => Promise<void>
+      openManageSubscriptionUrl: () => Promise<void>
+      checkForUpdates: () => Promise<void>
+      installUpdate: () => Promise<void>
       onDevicesUpdated: (cb: (devices: DeviceInfo[]) => void) => () => void
       onStateChanged: (cb: (s: { state?: ConnectionState; connectedDeviceId?: string | null; error?: string }) => void) => () => void
       onStopCapture: (cb: () => void) => () => void
       onSyncOffsetChanged: (cb: (ms: number) => void) => () => void
+      onUpdateStatus: (cb: (status: UpdateStatus) => void) => () => void
     }
   }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
 const MODEL_ICONS: Record<string, string> = {
   AppleTV: '📺',
   HomePod: '🔊',
@@ -56,16 +87,17 @@ function statusLabel(state: ConnectionState): string {
   return 'Not connected'
 }
 
-/** Returns inline style for a range slider with a filled track using the accent colour. */
-function sliderStyle(value: number, min: number, max: number): React.CSSProperties {
+function sliderStyle(value: number, min: number, max: number, disabled?: boolean): React.CSSProperties {
   const pct = ((value - min) / (max - min)) * 100
   return {
     flex: 1,
-    cursor: 'pointer',
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    opacity: disabled ? 0.4 : 1,
     background: `linear-gradient(to right, #00ff55 ${pct}%, #3a3a3c ${pct}%)`,
   }
 }
 
+// ── Component ─────────────────────────────────────────────────────────────────
 export function App() {
   const [devices, setDevices] = useState<DeviceInfo[]>([])
   const [connState, setConnState] = useState<ConnectionState>('idle')
@@ -83,10 +115,70 @@ export function App() {
   const [showOffline, setShowOffline] = useState(false)
   const [settingsTab, setSettingsTab] = useState<'settings' | 'instructions'>('settings')
   const [hoveredId, setHoveredId] = useState<string | null>(null)
+
+  // ── Auth & subscription ───────────────────────────────────────────────────
+  const [authStatus, setAuthStatus] = useState<AuthStatus>({ signedIn: false, isPremium: false })
+  const [signingIn, setSigningIn] = useState(false)
+  const [showAccountModal, setShowAccountModal] = useState(false)
+  const [upgradeContext, setUpgradeContext] = useState<string | null>(null)
+
+  // ── Auto-update ───────────────────────────────────────────────────────────
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null)
+
+  const isPremium = authStatus.isPremium
+
   const renameInputRef = useRef<HTMLInputElement>(null)
   const volumeDebounce = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // Load initial state
+  // ── Firebase auth + Firestore subscription listener ───────────────────────
+  useEffect(() => {
+    if (!_fbAuth) return
+
+    let unsubFirestore: (() => void) | null = null
+
+    const unsubAuth = onAuthStateChanged(_fbAuth, (user) => {
+      // Clean up previous Firestore listener
+      unsubFirestore?.()
+      unsubFirestore = null
+
+      if (!user) {
+        const status: AuthStatus = { signedIn: false, isPremium: false }
+        setAuthStatus(status)
+        window.airAudio.reportAuthStatus(status)
+        return
+      }
+
+      // Subscribe to Firestore /users/{uid} for real-time isPremium updates
+      if (_fbDb) {
+        const userRef = doc(_fbDb, 'users', user.uid)
+        unsubFirestore = onSnapshot(userRef, (snap) => {
+          const isPremium = snap.exists() ? (snap.data()?.isPremium === true) : false
+          const status: AuthStatus = {
+            signedIn: true,
+            uid: user.uid,
+            email: user.email ?? undefined,
+            isPremium,
+          }
+          setAuthStatus(status)
+          window.airAudio.reportAuthStatus(status)
+        }, () => {
+          // Firestore error (e.g. offline) — keep existing status, don't degrade
+        })
+      } else {
+        // No Firestore — just set signed in without premium
+        const status: AuthStatus = { signedIn: true, uid: user.uid, email: user.email ?? undefined, isPremium: false }
+        setAuthStatus(status)
+        window.airAudio.reportAuthStatus(status)
+      }
+    })
+
+    return () => {
+      unsubAuth()
+      unsubFirestore?.()
+    }
+  }, [])
+
+  // ── Load initial state ────────────────────────────────────────────────────
   useEffect(() => {
     window.airAudio.getState().then(({ devices, state, connectedDeviceId, latencySeconds, syncOffsetMs, volume }) => {
       setDevices(devices)
@@ -98,7 +190,7 @@ export function App() {
     })
   }, [])
 
-  // Subscribe to device list and state changes from main process
+  // ── Subscribe to IPC events ───────────────────────────────────────────────
   useEffect(() => {
     const unsub1 = window.airAudio.onDevicesUpdated((d) => setDevices(d))
     const unsub2 = window.airAudio.onStateChanged(({ state, connectedDeviceId, error }) => {
@@ -106,7 +198,6 @@ export function App() {
         setConnState(state)
         if (state === 'streaming') {
           startCapture(selectedSource).catch(console.error)
-          // Refresh source list once capture permission is granted
           getAudioSources().then(setAudioSources).catch(() => {})
         }
         if (state === 'idle' || state === 'error') stopCapture()
@@ -117,18 +208,38 @@ export function App() {
     })
     const unsub3 = window.airAudio.onStopCapture(() => stopCapture())
     const unsub4 = window.airAudio.onSyncOffsetChanged((ms) => setSyncOffset(ms))
-    return () => { unsub1(); unsub2(); unsub3(); unsub4() }
+    const unsub5 = window.airAudio.onUpdateStatus((s) => setUpdateStatus(s))
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5() }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSource])
 
+  // ── Premium gate helper ───────────────────────────────────────────────────
+  const openUpgradeModal = useCallback((context: string) => {
+    setUpgradeContext(context)
+    setShowAccountModal(true)
+  }, [])
+
+  // ── Handlers ─────────────────────────────────────────────────────────────
   const handleConnect = useCallback(async (deviceId: string) => {
     if (connectedId === deviceId) {
       await window.airAudio.disconnect()
       return
     }
+    // Offline device = Wake-on-LAN path = premium
+    const device = devices.find(d => d.id === deviceId)
+    if (device && !device.online && !isPremium) {
+      openUpgradeModal('Waking offline devices')
+      return
+    }
     setError(null)
-    await window.airAudio.connect(deviceId, volume)
-  }, [connectedId, volume])
+    try {
+      await window.airAudio.connect(deviceId, volume)
+    } catch (err) {
+      if ((err as Error).message?.includes('PREMIUM_REQUIRED')) {
+        openUpgradeModal('This feature')
+      }
+    }
+  }, [connectedId, volume, devices, isPremium, openUpgradeModal])
 
   const handleVolume = useCallback((val: number) => {
     setVolume(val)
@@ -139,9 +250,10 @@ export function App() {
   }, [connState])
 
   const handleLatency = useCallback((val: number) => {
+    if (!isPremium) { openUpgradeModal('Latency adjustment'); return }
     setLatency(val)
     window.airAudio.setLatency(val)
-  }, [])
+  }, [isPremium, openUpgradeModal])
 
   const handleSyncOffset = useCallback((val: number) => {
     setSyncOffset(val)
@@ -163,15 +275,17 @@ export function App() {
 
   const handlePin = useCallback((device: DeviceInfo, e: React.MouseEvent) => {
     e.stopPropagation()
+    if (!isPremium) { openUpgradeModal('Device pinning'); return }
     window.airAudio.pinDevice(device.id, !device.pinned)
-  }, [])
+  }, [isPremium, openUpgradeModal])
 
   const startRename = useCallback((device: DeviceInfo, e: React.MouseEvent) => {
     e.stopPropagation()
+    if (!isPremium) { openUpgradeModal('Custom device names'); return }
     setRenamingId(device.id)
     setRenameValue(device.name)
     setTimeout(() => renameInputRef.current?.select(), 0)
-  }, [])
+  }, [isPremium, openUpgradeModal])
 
   const commitRename = useCallback(() => {
     if (!renamingId) return
@@ -181,15 +295,209 @@ export function App() {
 
   const cancelRename = useCallback(() => setRenamingId(null), [])
 
+  const handleSignIn = useCallback(async () => {
+    if (!_fbAuth || !_googleProvider) return
+    setSigningIn(true)
+    try {
+      await signInWithPopup(_fbAuth, _googleProvider)
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code !== 'auth/popup-closed-by-user') {
+        console.error('[auth] Sign-in error:', err)
+      }
+    } finally {
+      setSigningIn(false)
+    }
+  }, [])
+
+  const handleSignOut = useCallback(async () => {
+    if (!_fbAuth) return
+    await signOut(_fbAuth)
+    setShowAccountModal(false)
+  }, [])
+
+  // ── Device list renderer ──────────────────────────────────────────────────
+  const renderDevice = (device: DeviceInfo) => {
+    const isConnected  = device.id === connectedId
+    const isActive     = isConnected && (connState === 'connecting' || connState === 'waking' || connState === 'streaming')
+    const isConnecting = (connState === 'connecting' || connState === 'waking') && device.id === connectedId
+    const isRenaming   = renamingId === device.id
+
+    return (
+      <div
+        key={device.id}
+        style={{
+          ...styles.deviceRow,
+          ...(isConnected && connState === 'streaming'
+            ? styles.deviceRowStreaming
+            : isActive
+            ? styles.deviceRowActive
+            : hoveredId === device.id
+            ? styles.deviceRowHover
+            : {}),
+          opacity: device.online ? 1 : 0.45,
+          cursor: 'pointer',
+        }}
+        onClick={() => !isRenaming && handleConnect(device.id)}
+        onMouseEnter={() => setHoveredId(device.id)}
+        onMouseLeave={() => setHoveredId(null)}
+      >
+        <span style={styles.deviceIcon}>{deviceIcon(device.model)}</span>
+        <span style={styles.deviceNameWrap}>
+          {isRenaming ? (
+            <input
+              ref={renameInputRef}
+              style={styles.renameInput}
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') commitRename()
+                if (e.key === 'Escape') cancelRename()
+                e.stopPropagation()
+              }}
+              onBlur={commitRename}
+              onClick={(e) => e.stopPropagation()}
+            />
+          ) : (
+            <>
+              <span
+                style={styles.deviceName}
+                onDoubleClick={(e) => startRename(device, e)}
+                title={isPremium ? 'Double-click to rename' : 'Double-click to rename (Premium)'}
+              >
+                {device.name}
+              </span>
+              {device.model && device.model !== 'AirPlay Device' && (
+                <span style={styles.deviceModel}>{device.model}</span>
+              )}
+            </>
+          )}
+        </span>
+        {(hoveredId === device.id || device.pinned) && !isRenaming && (
+          <button
+            style={styles.pinBtn}
+            onClick={(e) => handlePin(device, e)}
+            title={!isPremium ? 'Pin to top (Premium)' : device.pinned ? 'Unpin' : 'Pin to top'}
+          >
+            {device.pinned ? '★' : '☆'}
+          </button>
+        )}
+        <span style={{
+          ...styles.indicator,
+          ...(isConnected && connState === 'streaming'
+            ? { background: 'transparent', fontSize: 28, color: '#3a3a3c', width: 32, height: 32 }
+            : { background: isActive ? statusColor(connState) : '#3a3a3c' }),
+        }}>
+          {connState === 'waking' && isConnected ? '⚡' :
+           isConnecting ? '…' :
+           isConnected && connState === 'streaming' ? '✓' : ''}
+        </span>
+      </div>
+    )
+  }
+
+  const onlineDevices  = devices.filter(d => d.online)
+  // Offline devices section is premium-only
+  const offlineDevices = isPremium ? devices.filter(d => !d.online) : []
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div style={styles.container}>
+      {/* Account modal overlay */}
+      {showAccountModal && (
+        <div style={styles.modalOverlay} onClick={() => setShowAccountModal(false)}>
+          <div style={styles.modal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.modalHeader}>
+              <span style={styles.modalTitle}>
+                {authStatus.signedIn && authStatus.isPremium
+                  ? '★ AirAudio Premium'
+                  : authStatus.signedIn
+                  ? 'Your Account'
+                  : 'Sign in to AirAudio'}
+              </span>
+              <button style={styles.modalClose} onClick={() => setShowAccountModal(false)}>✕</button>
+            </div>
+
+            {upgradeContext && !authStatus.isPremium && (
+              <div style={styles.upgradeContext}>
+                🔒 {upgradeContext} requires Premium
+              </div>
+            )}
+
+            {!authStatus.signedIn && (
+              <>
+                <div style={styles.featureList}>
+                  {['Adjustable latency (0.5–2.0s)', 'AV sync + browser extension', 'Audio source selection', 'Custom device names & pinning', 'Wake-on-LAN for offline devices'].map(f => (
+                    <div key={f} style={styles.featureItem}>
+                      <span style={{ color: '#00ff55', marginRight: 7 }}>✓</span>{f}
+                    </div>
+                  ))}
+                </div>
+                <button
+                  style={{ ...styles.primaryBtn, opacity: signingIn ? 0.6 : 1 }}
+                  onClick={handleSignIn}
+                  disabled={signingIn || !_fbReady}
+                  title={!_fbReady ? 'Firebase not configured' : undefined}
+                >
+                  {signingIn ? 'Opening browser…' : 'Sign in with Google'}
+                </button>
+                <div style={styles.modalNote}>
+                  {_fbReady ? 'Sign in to access Premium features.' : 'Firebase not configured — contact developer.'}
+                </div>
+              </>
+            )}
+
+            {authStatus.signedIn && !authStatus.isPremium && (
+              <>
+                <div style={styles.accountEmail}>{authStatus.email}</div>
+                <div style={styles.featureList}>
+                  {['Adjustable latency (0.5–2.0s)', 'AV sync + browser extension', 'Audio source selection', 'Custom device names & pinning', 'Wake-on-LAN for offline devices'].map(f => (
+                    <div key={f} style={styles.featureItem}>
+                      <span style={{ color: '#00ff55', marginRight: 7 }}>✓</span>{f}
+                    </div>
+                  ))}
+                </div>
+                <button style={styles.primaryBtn} onClick={() => window.airAudio.openPurchaseUrl()}>
+                  Subscribe to Premium
+                </button>
+                <button style={styles.secondaryBtn} onClick={handleSignOut}>Sign out</button>
+              </>
+            )}
+
+            {authStatus.signedIn && authStatus.isPremium && (
+              <>
+                <div style={styles.accountEmail}>{authStatus.email}</div>
+                <div style={styles.premiumBadgeLarge}>PREMIUM ACTIVE</div>
+                <button style={styles.secondaryBtn} onClick={() => window.airAudio.openManageSubscriptionUrl()}>
+                  Manage subscription
+                </button>
+                <button style={styles.secondaryBtn} onClick={handleSignOut}>Sign out</button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div style={styles.header}>
-        <span style={styles.logo}>♫ AirAudio</span>
-        <span
-          style={{ ...styles.statusDot, background: statusColor(connState) }}
-          title={"🟢 Streaming\n🟡 Connecting\n🔴 Error\n⚫ Not connected"}
-        />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={styles.logo}>♫ AirAudio</span>
+          {authStatus.isPremium && (
+            <span style={styles.premiumChip}>PREMIUM</span>
+          )}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span
+            style={{ ...styles.statusDot, background: statusColor(connState) }}
+            title={"🟢 Streaming\n🟡 Connecting\n🔴 Error\n⚫ Not connected"}
+          />
+          <button
+            style={styles.accountBtn}
+            onClick={() => { setUpgradeContext(null); setShowAccountModal(true) }}
+            title={authStatus.signedIn ? authStatus.email ?? 'Account' : 'Sign in'}
+          >
+            {authStatus.signedIn ? '●' : '○'}
+          </button>
+        </div>
       </div>
 
       {/* Status */}
@@ -208,110 +516,48 @@ export function App() {
       <div className="device-list" style={styles.deviceList}>
         {devices.length === 0 ? (
           <div style={styles.empty}>Scanning for AirPlay devices…</div>
-        ) : (() => {
-          const onlineDevices  = devices.filter(d => d.online)
-          const offlineDevices = devices.filter(d => !d.online)
+        ) : (
+          <>
+            {onlineDevices.map(renderDevice)}
 
-          const renderDevice = (device: DeviceInfo) => {
-            const isConnected  = device.id === connectedId
-            const isActive     = isConnected && (connState === 'connecting' || connState === 'waking' || connState === 'streaming')
-            const isConnecting = (connState === 'connecting' || connState === 'waking') && device.id === connectedId
-            const isRenaming   = renamingId === device.id
-            return (
-              <div
-                key={device.id}
-                style={{
-                  ...styles.deviceRow,
-                  ...(isConnected && connState === 'streaming'
-                    ? styles.deviceRowStreaming
-                    : isActive
-                    ? styles.deviceRowActive
-                    : hoveredId === device.id
-                    ? styles.deviceRowHover
-                    : {}),
-                  opacity: device.online ? 1 : 0.45,
-                  cursor: 'pointer',
-                }}
-                onClick={() => !isRenaming && handleConnect(device.id)}
-                onMouseEnter={() => setHoveredId(device.id)}
-                onMouseLeave={() => setHoveredId(null)}
-              >
-                <span style={styles.deviceIcon}>{deviceIcon(device.model)}</span>
-                <span style={styles.deviceNameWrap}>
-                  {isRenaming ? (
-                    <input
-                      ref={renameInputRef}
-                      style={styles.renameInput}
-                      value={renameValue}
-                      onChange={(e) => setRenameValue(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') commitRename()
-                        if (e.key === 'Escape') cancelRename()
-                        e.stopPropagation()
-                      }}
-                      onBlur={commitRename}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  ) : (
-                    <>
-                      <span
-                        style={styles.deviceName}
-                        onDoubleClick={(e) => startRename(device, e)}
-                        title="Double-click to rename"
-                      >
-                        {device.name}
-                      </span>
-                      {device.model && device.model !== 'AirPlay Device' && (
-                        <span style={styles.deviceModel}>{device.model}</span>
-                      )}
-                    </>
-                  )}
-                </span>
-                {(hoveredId === device.id || device.pinned) && !isRenaming && (
-                  <button
-                    style={styles.pinBtn}
-                    onClick={(e) => handlePin(device, e)}
-                    title={device.pinned ? 'Unpin' : 'Pin to top'}
-                  >
-                    {device.pinned ? '★' : '☆'}
-                  </button>
-                )}
-                <span style={{
-                  ...styles.indicator,
-                  ...(isConnected && connState === 'streaming'
-                    ? { background: 'transparent', fontSize: 28, color: '#3a3a3c', width: 32, height: 32 }
-                    : { background: isActive ? statusColor(connState) : '#3a3a3c' }),
-                }}>
-                  {connState === 'waking' && isConnected ? '⚡' :
-                   isConnecting ? '…' :
-                   isConnected && connState === 'streaming' ? '✓' : ''}
-                </span>
-              </div>
-            )
-          }
-
-          return (
-            <>
-              {onlineDevices.map(renderDevice)}
-
-              {offlineDevices.length > 0 && (
-                <>
-                  <button
-                    style={styles.offlineToggle}
-                    onClick={() => setShowOffline(s => !s)}
-                  >
-                    <span style={styles.offlineToggleChevron}>
-                      {showOffline ? '▾' : '▸'}
-                    </span>
-                    {offlineDevices.length} offline device{offlineDevices.length > 1 ? 's' : ''}
-                  </button>
-                  {showOffline && offlineDevices.map(renderDevice)}
-                </>
-              )}
-            </>
-          )
-        })()}
+            {offlineDevices.length > 0 && (
+              <>
+                <button
+                  style={styles.offlineToggle}
+                  onClick={() => setShowOffline(s => !s)}
+                >
+                  <span style={styles.offlineToggleChevron}>
+                    {showOffline ? '▾' : '▸'}
+                  </span>
+                  {offlineDevices.length} offline device{offlineDevices.length > 1 ? 's' : ''}
+                </button>
+                {showOffline && offlineDevices.map(renderDevice)}
+              </>
+            )}
+          </>
+        )}
       </div>
+
+      {/* Update banner */}
+      {updateStatus && (updateStatus.type === 'available' || updateStatus.type === 'downloading' || updateStatus.type === 'ready') && (
+        <div style={styles.updateBanner}>
+          {updateStatus.type === 'available' && (
+            <>
+              <span>v{updateStatus.version} available</span>
+              <button style={styles.updateBtn} onClick={() => window.airAudio.checkForUpdates()}>Download</button>
+            </>
+          )}
+          {updateStatus.type === 'downloading' && (
+            <span>Downloading update… {updateStatus.percent}%</span>
+          )}
+          {updateStatus.type === 'ready' && (
+            <>
+              <span>v{updateStatus.version} ready</span>
+              <button style={styles.updateBtn} onClick={() => window.airAudio.installUpdate()}>Restart to install</button>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Volume control */}
       <div style={styles.controlRow}>
@@ -327,59 +573,67 @@ export function App() {
         <span style={styles.controlValue}>{volume}%</span>
       </div>
 
-      {/* Settings panel (toggled by gear button) */}
+      {/* Settings panel */}
       {showSettings && (
         <div style={styles.settingsPanel}>
-
-          {/* Tab bar */}
           <div style={styles.tabBar}>
-            {(['settings', 'instructions'] as const).map((tab) => (
+            {/* AV Sync tab is premium-only */}
+            {(['settings', ...(isPremium ? ['instructions' as const] : [])] as const).map((tab) => (
               <button
                 key={tab}
                 style={{ ...styles.tabBtn, ...(settingsTab === tab ? styles.tabBtnActive : {}) }}
-                onClick={() => setSettingsTab(tab)}
+                onClick={() => setSettingsTab(tab as 'settings' | 'instructions')}
               >
                 {tab === 'settings' ? 'Settings' : 'AV Sync'}
               </button>
             ))}
           </div>
 
-          {/* Settings tab */}
           {settingsTab === 'settings' && (
             <>
-              <div style={styles.controlRow}>
-                <span style={styles.controlLabel}>Source</span>
-                <select
-                  value={selectedSource}
-                  onChange={(e) => handleSourceChange(e.target.value)}
-                  style={styles.sourceSelect}
-                >
-                  {audioSources.map((s) => (
-                    <option key={s.id} value={s.id}>{s.label}</option>
-                  ))}
-                </select>
-              </div>
-              <div style={styles.controlRow}>
+              {/* Source selector — premium only */}
+              {isPremium && (
+                <div style={styles.controlRow}>
+                  <span style={styles.controlLabel}>Source</span>
+                  <select
+                    value={selectedSource}
+                    onChange={(e) => handleSourceChange(e.target.value)}
+                    style={styles.sourceSelect}
+                  >
+                    {audioSources.map((s) => (
+                      <option key={s.id} value={s.id}>{s.label}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {/* Latency slider — disabled with lock for free users */}
+              <div
+                style={styles.controlRow}
+                onClick={!isPremium ? () => openUpgradeModal('Latency adjustment') : undefined}
+              >
                 <span style={styles.controlLabel}>Latency</span>
+                {!isPremium && <span style={{ fontSize: 11, marginRight: 2 }}>🔒</span>}
                 <input
                   type="range"
                   min={0.5}
                   max={2.0}
                   step={0.5}
-                  value={latency}
+                  value={isPremium ? latency : 1.0}
+                  disabled={!isPremium}
                   onChange={(e) => handleLatency(Number((e.target as HTMLInputElement).value))}
-                  style={sliderStyle(latency, 0.5, 2.0)}
-                  title="Lower = more responsive, higher = more stable on weak WiFi. Reconnect to apply."
+                  style={sliderStyle(isPremium ? latency : 1.0, 0.5, 2.0, !isPremium)}
+                  title={!isPremium ? 'Premium feature — click to upgrade' : 'Lower = more responsive, higher = more stable on weak WiFi'}
                 />
-                <span style={styles.controlValue}>{latency.toFixed(1)}s</span>
+                <span style={{ ...styles.controlValue, opacity: isPremium ? 1 : 0.4 }}>
+                  {isPremium ? `${latency.toFixed(1)}s` : '1.0s'}
+                </span>
               </div>
             </>
           )}
 
-          {/* AV Sync / Instructions tab */}
-          {settingsTab === 'instructions' && (
+          {settingsTab === 'instructions' && isPremium && (
             <div style={styles.instructionsPanel}>
-              {/* Sync offset trim */}
               <div style={{ ...styles.controlRow, flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <span style={{ ...styles.controlLabel, width: 'auto', fontSize: 11, color: '#636366' }}>◀ audio ahead</span>
@@ -398,7 +652,6 @@ export function App() {
                   style={sliderStyle(syncOffset, -500, 2500)}
                 />
               </div>
-
               <p style={styles.instrIntro}>
                 Install the browser extension to keep video in sync with your AirPlay speakers.
               </p>
@@ -421,7 +674,6 @@ export function App() {
               </button>
             </div>
           )}
-
         </div>
       )}
 
@@ -430,11 +682,7 @@ export function App() {
         <div style={styles.footerLeft}>
           {connState === 'streaming' ? (
             <>
-              <button
-                style={styles.muteBtn}
-                onClick={handleMute}
-                title={muted ? 'Unmute' : 'Mute'}
-              >
+              <button style={styles.muteBtn} onClick={handleMute} title={muted ? 'Unmute' : 'Mute'}>
                 {muted ? '🔇' : '🔊'}
               </button>
               <button style={styles.disconnectBtn} onClick={() => window.airAudio.disconnect()}>
@@ -442,7 +690,17 @@ export function App() {
               </button>
             </>
           ) : (
-            <span style={styles.hint}>Click a device to connect</span>
+            <>
+              <span style={styles.hint}>Click a device to connect</span>
+              {!authStatus.isPremium && (
+                <button
+                  style={styles.upgradeLink}
+                  onClick={() => { setUpgradeContext(null); setShowAccountModal(true) }}
+                >
+                  {authStatus.signedIn ? 'Upgrade' : 'Sign in for Premium'}
+                </button>
+              )}
+            </>
           )}
         </div>
         <button
@@ -455,6 +713,7 @@ export function App() {
   )
 }
 
+// ── Styles ────────────────────────────────────────────────────────────────────
 const styles: Record<string, React.CSSProperties> = {
   container: {
     display: 'flex',
@@ -462,6 +721,7 @@ const styles: Record<string, React.CSSProperties> = {
     height: '100vh',
     background: '#1c1c1e',
     color: '#fff',
+    position: 'relative',
   },
   header: {
     display: 'flex',
@@ -469,6 +729,30 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: 'space-between',
     padding: '16px 18px 12px',
     borderBottom: '1px solid #2c2c2e',
+  },
+  logo: {
+    fontWeight: 600,
+    fontSize: 15,
+    letterSpacing: '-0.3px',
+  },
+  premiumChip: {
+    fontSize: 9,
+    fontWeight: 700,
+    letterSpacing: '0.5px',
+    color: '#00ff55',
+    background: '#00ff5520',
+    border: '1px solid #00ff5540',
+    borderRadius: 4,
+    padding: '1px 5px',
+  },
+  accountBtn: {
+    background: 'none',
+    border: 'none',
+    fontSize: 12,
+    cursor: 'pointer',
+    padding: 0,
+    color: '#636366',
+    lineHeight: 1,
   },
   gearBtn: {
     background: 'none',
@@ -479,16 +763,12 @@ const styles: Record<string, React.CSSProperties> = {
     lineHeight: 1,
     transition: 'color 0.15s',
   },
-  logo: {
-    fontWeight: 600,
-    fontSize: 15,
-    letterSpacing: '-0.3px',
-  },
   statusDot: {
     width: 10,
     height: 10,
     borderRadius: '50%',
     transition: 'background 0.3s',
+    flexShrink: 0,
   },
   statusBar: {
     padding: '7px 18px',
@@ -590,6 +870,26 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: 'center',
     fontSize: 9,
     flexShrink: 0,
+  },
+  updateBanner: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '6px 16px',
+    background: '#0a84ff22',
+    borderTop: '1px solid #0a84ff44',
+    fontSize: 11,
+    color: '#0a84ff',
+  },
+  updateBtn: {
+    background: '#0a84ff',
+    border: 'none',
+    borderRadius: 6,
+    color: '#fff',
+    fontSize: 11,
+    padding: '3px 10px',
+    cursor: 'pointer',
+    fontWeight: 600,
   },
   settingsPanel: {
     borderTop: '1px solid #2c2c2e',
@@ -720,6 +1020,15 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     color: '#48484a',
   },
+  upgradeLink: {
+    background: 'none',
+    border: 'none',
+    color: '#0a84ff',
+    fontSize: 11,
+    cursor: 'pointer',
+    padding: 0,
+    textDecoration: 'underline',
+  },
   offlineToggle: {
     display: 'flex',
     alignItems: 'center',
@@ -750,5 +1059,106 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '3px 6px',
     cursor: 'pointer',
     outline: 'none',
+  },
+  // ── Account modal ──────────────────────────────────────────────────────────
+  modalOverlay: {
+    position: 'absolute',
+    inset: 0,
+    background: 'rgba(0,0,0,0.7)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 100,
+  },
+  modal: {
+    width: 280,
+    background: '#1c1c1e',
+    border: '1px solid #3a3a3c',
+    borderRadius: 14,
+    padding: '18px 20px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 10,
+  },
+  modalHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 2,
+  },
+  modalTitle: {
+    fontWeight: 600,
+    fontSize: 14,
+  },
+  modalClose: {
+    background: 'none',
+    border: 'none',
+    color: '#636366',
+    fontSize: 13,
+    cursor: 'pointer',
+    padding: 0,
+    lineHeight: 1,
+  },
+  upgradeContext: {
+    fontSize: 11,
+    color: '#ffd60a',
+    background: '#ffd60a15',
+    border: '1px solid #ffd60a30',
+    borderRadius: 7,
+    padding: '5px 9px',
+  },
+  featureList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 5,
+    padding: '4px 0',
+  },
+  featureItem: {
+    fontSize: 12,
+    color: '#ebebf5cc',
+    display: 'flex',
+    alignItems: 'center',
+  },
+  accountEmail: {
+    fontSize: 12,
+    color: '#8e8e93',
+    textAlign: 'center' as const,
+  },
+  premiumBadgeLarge: {
+    textAlign: 'center' as const,
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '1px',
+    color: '#00ff55',
+    background: '#00ff5515',
+    border: '1px solid #00ff5530',
+    borderRadius: 8,
+    padding: '6px 0',
+  },
+  primaryBtn: {
+    width: '100%',
+    padding: '9px 0',
+    background: '#0a84ff',
+    border: 'none',
+    borderRadius: 9,
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  secondaryBtn: {
+    width: '100%',
+    padding: '8px 0',
+    background: '#2c2c2e',
+    border: '1px solid #3a3a3c',
+    borderRadius: 9,
+    color: '#ebebf5',
+    fontSize: 12,
+    cursor: 'pointer',
+  },
+  modalNote: {
+    fontSize: 10,
+    color: '#48484a',
+    textAlign: 'center' as const,
   },
 }

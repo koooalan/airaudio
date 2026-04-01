@@ -1,6 +1,6 @@
 {
   "name": "airaudio",
-  "version": "1.0.2-beta",
+  "version": "1.1.0",
   "description": "Stream Windows system audio to AirPlay receivers",
   "type": "module",
   "main": "out/main/index.js",

@@ -27,4 +27,12 @@ module.exports = {
     createStartMenuShortcut: true,
     runAfterFinish: true,
   },
+
+  publish: [{
+    provider: 'github',
+    // TODO: set owner and repo before cutting the first release
+    owner: 'YOUR_GITHUB_USERNAME',
+    repo: 'airaudio',
+    releaseType: 'release',
+  }],
 }
