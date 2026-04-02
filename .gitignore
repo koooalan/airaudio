@@ -17,6 +17,9 @@ desktop.ini
 # Claude Code local settings
 .claude/
 
+# Temp files
+~*.tmp
+
 # Design/working files
 *.ai
 Screenshot*.png
