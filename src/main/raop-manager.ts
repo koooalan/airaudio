@@ -13,6 +13,7 @@ const { applyConfig } = require('@lox-audioserver/node-airplay-sender/dist/utils
 import { Discovery, type DiscoveryResult } from '@basmilius/apple-common'
 import type { DeviceInfo, ConnectionState } from '../shared/types.js'
 import { configStore } from './config-store.js'
+import { LoopbackSource } from './loopback-source.js'
 
 export type { DeviceInfo, ConnectionState }
 
@@ -31,6 +32,11 @@ export class RaopManager {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private sender: any = null
   private senderReady = false
+
+  // Native WASAPI loopback (bypasses Chromium pipeline for system audio)
+  private loopbackSource: LoopbackSource | null = null
+  private _nativeLoopActive = false
+  private _sourceId: string | null = null
 
   // Reconnect state
   private userDisconnected = false
@@ -125,7 +131,7 @@ export class RaopManager {
     })
   }
 
-  async connect(deviceId: string, volume: number): Promise<void> {
+  async connect(deviceId: string, volume: number, sourceId: string | null = null): Promise<void> {
     if (this.state === 'connecting' || this.state === 'streaming' || this.state === 'waking') {
       await this.disconnect()
     }
@@ -144,6 +150,7 @@ export class RaopManager {
     this.reconnectAttempts = 0
     this.lastDeviceId = deviceId
     this.lastVolume = volume
+    this._sourceId = sourceId
     this._clearTimers()
 
     this.setState('connecting', deviceId)
@@ -195,6 +202,9 @@ export class RaopManager {
           this.senderReady = true
           this.reconnectAttempts = 0  // successful — reset retry counter
           this.setState('streaming', deviceId)
+          if (!this._sourceId || this._sourceId === 'loopback') {
+            this._runNativeLoopback().catch(console.error)
+          }
         } else if (msg === 'pair_failed') {
           // AirPlay 2 pairing rejected — remember this device as AirPlay 1 only
           this._airplay1DeviceIds.add(deviceId)
@@ -229,6 +239,10 @@ export class RaopManager {
   }
 
   private _teardown(): void {
+    this._nativeLoopActive = false
+    this.loopbackSource?.stop().catch(() => {})
+    this.loopbackSource = null
+
     const s = this.sender
     // Null out first so the stale-callback guard prevents double state changes
     this.sender = null
@@ -360,6 +374,9 @@ export class RaopManager {
           this.senderReady = true
           this.reconnectAttempts = 0
           this.setState('streaming', deviceId)
+          if (!this._sourceId || this._sourceId === 'loopback') {
+            this._runNativeLoopback().catch(console.error)
+          }
         } else if (msg === 'pair_failed') {
           this._airplay1DeviceIds.add(deviceId)
           this._pairFailed = true
@@ -388,6 +405,7 @@ export class RaopManager {
   /** Called from IPC when the renderer sends a PCM chunk. */
   feedPcm(chunk: Buffer | Uint8Array): void {
     if (!this.sender || !this.senderReady) return
+    if (this._nativeLoopActive) return  // native WASAPI path handles audio; ignore IPC chunks
     // Electron IPC may deserialize Buffer as Uint8Array — normalise
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
 
@@ -404,6 +422,19 @@ export class RaopManager {
 
     this.sender.sendPcm(buf)
     this._feedBytesTotal += buf.length
+  }
+
+  private async _runNativeLoopback(): Promise<void> {
+    this._nativeLoopActive = true
+    this.loopbackSource = new LoopbackSource()
+    await this.loopbackSource.start()
+    while (this._nativeLoopActive && this.senderReady) {
+      const frames = await this.loopbackSource.readFrames(FRAMES_PER_PACKET)
+      if (!frames) break
+      this.sender?.sendPcm(frames)
+    }
+    await this.loopbackSource.stop()
+    this.loopbackSource = null
   }
 
   setVolume(volumePct: number): void {

@@ -4,6 +4,10 @@ import { fileURLToPath } from 'node:url'
 import { RaopManager } from './raop-manager.js'
 import { registerIpcHandlers } from './ipc-handlers.js'
 import { createSyncServer, type SyncServer } from './sync-server.js'
+import { authManager } from './auth-manager.js'
+import { configStore } from './config-store.js'
+import { initAutoUpdater } from './update-manager.js'
+import type { UpdateStatus } from '../shared/types.js'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
@@ -13,6 +17,18 @@ app.dock?.hide?.()
 
 // Launch automatically when Windows starts
 app.setLoginItemSettings({ openAtLogin: true, name: 'AirAudio' })
+
+// Register custom protocol for potential future use (OAuth deep-links etc.)
+if (process.defaultApp) {
+  if (process.argv.length >= 2) {
+    app.setAsDefaultProtocolClient('airaudio', process.execPath, [process.argv[1]])
+  }
+} else {
+  app.setAsDefaultProtocolClient('airaudio')
+}
+
+// Restore cached auth state so requirePremium() works before the renderer loads
+authManager.initFromCache(configStore.getAuthCache())
 
 let tray: Tray | null = null
 let popup: BrowserWindow | null = null
@@ -36,6 +52,17 @@ function createPopup(): BrowserWindow {
   })
 
   win.on('blur', () => win.hide())
+
+  // Allow Google OAuth popups opened by Firebase signInWithPopup()
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (
+      url.startsWith('https://accounts.google.com') ||
+      url.includes('firebaseapp.com/__/auth')
+    ) {
+      return { action: 'allow' }
+    }
+    return { action: 'deny' }
+  })
 
   if (process.env['ELECTRON_RENDERER_URL']) {
     win.loadURL(process.env['ELECTRON_RENDERER_URL'])
@@ -103,8 +130,17 @@ app.whenReady().then(() => {
     popup?.webContents.send('sync-offset-changed', ms)
   })
 
-  // Forward manager state changes (stream dropped, device lost, etc.) to the popup
-  // and update the tray icon to reflect the current state
+  // Push auth status changes to the popup
+  authManager.onStatusChange = (status) => {
+    popup?.webContents.send('auth-status-changed', status)
+  }
+
+  // Push update status to the popup
+  initAutoUpdater((status: UpdateStatus) => {
+    popup?.webContents.send('update-status', status)
+  })
+
+  // Forward manager state changes to the popup and update the tray icon
   raopManager.onStateChange = (state, connectedDeviceId) => {
     popup?.webContents.send('state-changed', { state, connectedDeviceId })
     const trayIcon = state === 'streaming' ? icons.streaming
