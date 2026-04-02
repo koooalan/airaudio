@@ -36,7 +36,7 @@ function load(): StoredConfig {
   } catch {
     // Corrupt or missing — start fresh
   }
-  return { knownDevices: {}, customNames: {}, pinnedDevices: [], latencySeconds: 1.0, syncOffsetMs: 0, airplay1DeviceIds: [], authCache: undefined }
+  return { knownDevices: {}, customNames: {}, pinnedDevices: [], latencySeconds: 0.5, syncOffsetMs: 0, airplay1DeviceIds: [], authCache: undefined }
 }
 
 function save(): void {
@@ -51,7 +51,7 @@ let _cfg = load()
 
 export const configStore = {
   // ── Latency ──────────────────────────────────────────────────────────────
-  get latencySeconds(): number { return _cfg.latencySeconds ?? 1.0 },
+  get latencySeconds(): number { return _cfg.latencySeconds ?? 0.5 },
   setLatencySeconds(v: number): void { _cfg.latencySeconds = v; save() },
 
   // ── AV sync offset (ms) — trims video delay relative to audio latency ────

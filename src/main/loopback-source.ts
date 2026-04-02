@@ -39,6 +39,7 @@ export class LoopbackSource implements AudioSource {
     this.proc = spawn(ffmpeg, [
       '-f', 'wasapi',
       '-loopback', '1',
+      '-audio_buffer_size', '10',
       '-i', 'default',
       '-f', 's16le',
       '-ar', String(AUDIO_SAMPLE_RATE),

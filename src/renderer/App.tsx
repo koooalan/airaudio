@@ -233,7 +233,7 @@ export function App() {
     }
     setError(null)
     try {
-      await window.airAudio.connect(deviceId, volume)
+      await window.airAudio.connect(deviceId, volume, selectedSource)
     } catch (err) {
       if ((err as Error).message?.includes('PREMIUM_REQUIRED')) {
         openUpgradeModal('This feature')

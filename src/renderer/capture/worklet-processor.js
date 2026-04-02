@@ -24,8 +24,10 @@ class PcmCapture extends AudioWorkletProcessor {
     const right = input[1] ?? input[0] ?? new Float32Array(128)  // mono fallback
 
     for (let i = 0; i < left.length; i++) {
-      this._buf[this._pos * CHANNELS]     = Math.max(-32768, Math.min(32767, left[i]  * 32767))
-      this._buf[this._pos * CHANNELS + 1] = Math.max(-32768, Math.min(32767, right[i] * 32767))
+      const dl = Math.random() + Math.random() - 1  // TPDF triangular dither
+      const dr = Math.random() + Math.random() - 1
+      this._buf[this._pos * CHANNELS]     = Math.round(Math.max(-32768, Math.min(32767, left[i]  * 32768 + dl)))
+      this._buf[this._pos * CHANNELS + 1] = Math.round(Math.max(-32768, Math.min(32767, right[i] * 32768 + dr)))
       this._pos++
 
       if (this._pos >= FRAMES_PER_PACKET) {

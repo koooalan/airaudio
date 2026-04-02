@@ -67,7 +67,7 @@ export function registerIpcHandlers(
   })
 
   /** Connect to a device and start streaming system audio. */
-  ipcMain.handle('connect', async (_event, deviceId: string, volume: number) => {
+  ipcMain.handle('connect', async (_event, deviceId: string, volume: number, sourceId: string | null = null) => {
     // Wake-on-LAN requires premium (offline device → WoL path)
     const device = manager.listDevices().find(d => d.id === deviceId)
     if (device && !device.online) {
@@ -75,11 +75,15 @@ export function registerIpcHandlers(
     }
 
     try {
-      await manager.connect(deviceId, volume)
+      await manager.connect(deviceId, volume, sourceId)
       popup.webContents.send('state-changed', {
         state: manager.state,
         connectedDeviceId: manager.connectedDeviceId,
       })
+      // When native WASAPI loopback is active, the renderer's AudioWorklet is not needed
+      if (!sourceId || sourceId === 'loopback') {
+        popup.webContents.send('stop-capture')
+      }
     } catch (err) {
       popup.webContents.send('state-changed', { state: 'error', error: (err as Error).message })
       throw err

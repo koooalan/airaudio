@@ -13,8 +13,8 @@ const api = {
   getState: (): Promise<AppState> =>
     ipcRenderer.invoke('get-state'),
 
-  connect: (deviceId: string, volume: number): Promise<void> =>
-    ipcRenderer.invoke('connect', deviceId, volume),
+  connect: (deviceId: string, volume: number, sourceId: string | null = null): Promise<void> =>
+    ipcRenderer.invoke('connect', deviceId, volume, sourceId),
 
   disconnect: (): Promise<void> =>
     ipcRenderer.invoke('disconnect'),
